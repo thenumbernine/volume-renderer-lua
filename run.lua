@@ -97,9 +97,12 @@ function App:initGL()
 
 	self.cuboidWireframe = CuboidWireframe{
 		view = self.view,
-		volumeMin = volumeRange.min.s,
-		volumeMax = volumeRange.max.s,
+		color = {.5, .5, .5, 1},
 	}
+	-- set it to update every frame
+	self.cuboidWireframe.globj.uniforms.mins = volumeRange.min.s
+	self.cuboidWireframe.globj.uniforms.maxs = volumeRange.max.s
+
 
 	self.hsvTex = GLHSVTex2D(256, nil, true)
 		:unbind()
@@ -311,7 +314,7 @@ function App:updateGUI()
 
 			ig.luatableCheckbox('useLog', vars, 'useLog')
 	
---[[
+-- [[
 			ig.igInputFloat('volumeMinX', volumeRange.min.s + 0)
 			ig.igInputFloat('volumeMinY', volumeRange.min.s + 1)
 			ig.igInputFloat('volumeMinZ', volumeRange.min.s + 2)
