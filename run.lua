@@ -7,16 +7,14 @@ local vec2f = require 'vec-ffi.vec2f'
 local vec3i = require 'vec-ffi.vec3i'
 local vec3f = require 'vec-ffi.vec3f'
 local box3f = require 'vec-ffi.box3f'
-local vector = require 'ffi.cpp.vector-lua'
 local gl = require 'gl.setup'(cmdline.gl)
 local glnumber = require 'gl.number'
-local GLTex2D = require 'gl.tex2d'
 local GLSceneObject = require 'gl.sceneobject'
 local GLHSVTex2D = require 'gl.hsvtex2d'
 local GLArrayBuffer = require 'gl.arraybuffer'
-local GLTex3D = require 'gl.tex3d'
 local ig = require 'imgui'
-
+local CuboidWireframe = require 'volume-renderer.cuboid-wireframe'
+local VolumeRenderer = require 'volume-renderer'
 
 
 local densitySize = vec3i(64, 64, 64) 
@@ -39,7 +37,7 @@ local function recalc()
 	local ptr = densityData+0
 	local fw = vars.mandelConst
 	local perm = vars.mandelPerm
-print('perm', perm)	
+print('perm', perm)	-- I'm not seeing a difference	
 	densityRange:set(math.huge, -math.huge)
 	for k=0,densitySize.z-1 do
 		local fz = (k+.5)/tonumber(densitySize.z) * (b.max.z - b.min.z) + b.min.z
@@ -97,57 +95,11 @@ local App = require 'imgui.appwithorbit'()
 function App:initGL()
 	App.super.initGL(self)
 
--- [=[
-	_G.lineVtxCPU = vector(vec3f)
-	local cornerbits = function(i)
-		return bit.band(i,1),
-			bit.band(bit.rshift(i,1),1),
-			bit.band(bit.rshift(i,2),1)
-	end
-	for i=0,7 do
-		for j=0,2 do
-			local k = bit.bxor(i, bit.lshift(1, j))
-			if k > i then
-				lineVtxCPU:emplace_back()[0]:set(cornerbits(i))
-				lineVtxCPU:emplace_back()[0]:set(cornerbits(k))
-			end
-		end
-	end
-	self.lineObj = GLSceneObject{
-		program = {
-			version = 'latest',
-			precision = 'best',
-			vertexCode = [[
-layout(location=0) in vec3 vertex;
-uniform mat4 mvProjMat;
-uniform vec3 volumeMin, volumeMax;
-void main() {
-	gl_Position = mvProjMat * vec4(
-		mix(volumeMin, volumeMax, vertex),
-		1.
-	);
-}
-]],
-			fragmentCode = [[
-layout(location=0) out vec4 fragColor;
-
-void main() {
-	fragColor = vec4(.5, .5, .5, 1.);
-}
-]],
-		},
-		vertexes = {
-			dim = 3,
-			data = lineVtxCPU.v,
-			size = lineVtxCPU:getNumBytes(),
-		},
-		geometry = {
-			mode = gl.GL_LINES,
-			count = #lineVtxCPU,
-		},
+	self.cuboidWireframe = CuboidWireframe{
+		view = self.view,
+		volumeMin = volumeRange.min.s,
+		volumeMax = volumeRange.max.s,
 	}
---]=]
-
 
 	self.hsvTex = GLHSVTex2D(256, nil, true)
 		:unbind()
@@ -193,26 +145,11 @@ void main() {
 --]=]
 
 -- [=[
-	self.volumeTex = GLTex3D{
-		width = densitySize.x,
-		height = densitySize.y,
-		depth = densitySize.z,
-		internalFormat = gl.GL_R32F,
+	self.volumeRenderer = VolumeRenderer{
+		size = densitySize,
 		data = densityData,
-		--[[ mipmapping messes with transparency across slices so ....
-		magFilter = gl.GL_LINEAR,
-		minFilter = gl.GL_LINEAR_MIPMAP_LINEAR,
-		generateMipmap = true,
-		--]]
-		-- [[
-		magFilter = gl.GL_NEAREST,
-		minFilter = gl.GL_NEAREST,
-		--]]
-		wrap = {
-			s = gl.GL_CLAMP_TO_EDGE,
-			t = gl.GL_CLAMP_TO_EDGE,
-		},
-	}:unbind()
+	}
+	self.volumeTex = self.volumeRenderer.tex
 
 --[[ how to swap after-the-fact ?
 	self.volumeObj.vertexes = self.vtxGPUsPerSide[1]
@@ -296,12 +233,11 @@ end
 function App:update()
 	gl.glClear(bit.bor(gl.GL_COLOR_BUFFER_BIT, gl.GL_DEPTH_BUFFER_BIT))
 
-	if self.lineObj then
-		self.lineObj.uniforms.mvProjMat = self.view.mvProjMat.ptr
-		self.lineObj.uniforms.volumeMin = volumeRange.min.s
-		self.lineObj.uniforms.volumeMax = volumeRange.max.s
-		self.lineObj:draw()
+	if self.cuboidWireframe then
+		-- TODO view mvMat scale to cube size
+		self.cuboidWireframe:draw()
 	end
+
 
 	local volumeObj = self.volumeObj
 	if volumeObj then
