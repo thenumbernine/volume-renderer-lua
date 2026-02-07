@@ -36,14 +36,14 @@ function App:initGL()
 
 	self.volumeRenderer = VolumeRenderer{
 		view = self.view,
-		size = {128, 128, 128},
+		size = {256, 256, 256},
 		--useLog = true,
 	}
 	-- set it to update every frame
 	self.volumeRenderer.globj.uniforms.mins = self.bbox.min.s
 	self.volumeRenderer.globj.uniforms.maxs = self.bbox.max.s
 	
-	self.graphSize = box3f({-2, -2, -2}, {2, 2, 2})
+	self.graphSize = box3f({-1, -1, -1}, {1, 1, 1})
 	self:recalc()
 	
 	gl.glEnable(gl.GL_DEPTH_TEST)

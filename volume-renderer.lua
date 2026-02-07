@@ -116,7 +116,7 @@ print'allocating new data'
 	self.view = assert.index(args, 'view')
 
 	-- .x = period, .y = offset, .z = gamma
-	self.densityAlphaRange = vec3f(3, 0, 100)	
+	self.densityAlphaRange = vec3f(2, 0, 100)	
 
 	-- valueRange holds the density range
 	-- logValueRange holds the log-mapped density range
