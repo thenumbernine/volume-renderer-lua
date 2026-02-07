@@ -15,6 +15,8 @@ local VolumeRenderer = require 'volume-renderer'
 
 local App = require 'imgui.appwithorbit'()
 
+App.viewDist = 3
+
 function App:initGL()
 	App.super.initGL(self)
 
@@ -22,11 +24,17 @@ function App:initGL()
 	self.mandelConst = -.5
 	self.mandelPerm = 2	-- 0-3
 	self.mandelEscapeNormSq = 4
+	self.autoUpdateValueRange = false	-- done on cpu so it goes slow
 	self.recalcWithCompute = not cmdline.recalcWithCPU
 
+	self.valueCPUDirty = nil -- true means GPU needs update to CPU contents
+	self.valueGPUDirty = nil -- true means CPU needs update to GPU contents
+
+	-- set to true to update valueRangeDirty from valueCPU
+	self.valueRangeDirty = nil
 
 	-- range in 3D space
-	self.bbox = box3f(
+	self.worldBBox = box3f(
 		{-1, -1, -1},
 		{1, 1, 1}
 	)
@@ -36,24 +44,25 @@ function App:initGL()
 		color = {.5, .5, .5, 1},
 	}
 	-- set it to update every frame
-	self.cuboidWireframe.globj.uniforms.mins = self.bbox.min.s
-	self.cuboidWireframe.globj.uniforms.maxs = self.bbox.max.s
+	self.cuboidWireframe.globj.uniforms.mins = self.worldBBox.min.s
+	self.cuboidWireframe.globj.uniforms.maxs = self.worldBBox.max.s
 
 
 	-- TODO allow it to be passed its own GLTex3D as well
 	self.vol = VolumeRenderer{
 		view = self.view,
-		--size = {4,4,4}, 
+		--size = {4,4,4},
 		size = {256, 256, 256},
+		--size = {512, 512, 512},
 		--useLog = true,
 	}
+	self.vol.valueRange:set(0, self.mandelMaxIter)
 
 	-- set it to update every frame
-	self.vol.globj.uniforms.mins = self.bbox.min.s
-	self.vol.globj.uniforms.maxs = self.bbox.max.s
+	self.vol.globj.uniforms.mins = self.worldBBox.min.s
+	self.vol.globj.uniforms.maxs = self.worldBBox.max.s
 
-	self.graphSize = box3f({-1, -1, -1}, {1, 1, 1})
-
+	self.graphBBox = box3f({-1, -1, -1}, {1, 1, 1})
 
 	-- prepare our mandelbrot calc compute shader
 
@@ -80,7 +89,7 @@ function App:initGL()
 
 	print('computeSize', self.vol.size)
 
-	-- product must be <= GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS 
+	-- product must be <= GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS
 	self.computeLocalSize = vec3i()
 	self.computeLocalSize.x = math.min(
 		self.vol.size.x,
@@ -98,7 +107,7 @@ function App:initGL()
 
 	self.computeNumGroups = self.vol.size / self.computeLocalSize
 	print('computeNumGroups', self.computeNumGroups)
-	-- TODO this assertion is not necessary, but if it fails that means I will have to add bounds-checking of the index to the kernels.	
+	-- TODO this assertion is not necessary, but if it fails that means I will have to add bounds-checking of the index to the kernels.
 	assert.eq(self.computeNumGroups:elemMul(self.computeLocalSize), self.vol.size)
 
 	self.computeShader = GLProgram{
@@ -129,7 +138,7 @@ void main() {
 		mandelConst
 	);
 	dvec2 z, c;
-	
+
 	if (mandelPerm == 0) {
 		z = dvec2(f.w, f.x);
 		c = dvec2(f.y, f.z);
@@ -169,7 +178,7 @@ void main() {
 		:useNone()
 
 	self:recalc()
-	
+
 	gl.glEnable(gl.GL_DEPTH_TEST)
 end
 
@@ -179,23 +188,10 @@ function App:recalc()
 	else
 		self:recalcCPU()
 	end
-
-	-- [[ update the range data
-	-- this could be done much faster as a reduce kernel
-	-- I'm already doing it this way in my hydro-cl project
-	local valueRange = self.vol.valueRange
-	valueRange:set(math.huge, -math.huge)
-	local ptr = self.vol.data+0
-	for i=0,self.vol.size:volume()-1 do
-		valueRange.x = math.min(valueRange.x, ptr[0])
-		valueRange.y = math.max(valueRange.y, ptr[0])
-		ptr=ptr+1	
-	end
-	--]]
 end
 
 function App:recalcCPU()
-	local b = self.graphSize
+	local b = self.graphBBox
 	local ptr = self.vol.data+0
 	local fw = self.mandelConst
 	local mandelPerm = self.mandelPerm
@@ -207,7 +203,7 @@ function App:recalcCPU()
 			local fy = (j+.5)/tonumber(size.y) * (b.max.y - b.min.y) + b.min.y
 			for i=0,size.x-1 do
 				local fx = (i+.5)/tonumber(size.x) * (b.max.x - b.min.x) + b.min.x
-				
+
 				-- mandelbrot init is z={0,0}, c={x,y}
 				-- julia init is z={x,y}, c=fixed
 				local zr, zi, cr, ci = 0,0,0,0
@@ -220,7 +216,7 @@ function App:recalcCPU()
 				elseif mandelPerm == 3 then
 					zr, zi, cr, ci = fx, fy, fz, fw
 				end
-	
+
 				for iter=0,self.mandelMaxIter do
 					zr, zi = zr*zr - zi*zi + cr, 2*zr*zi + ci
 					local zn = zr*zr + zi*zi
@@ -235,19 +231,16 @@ function App:recalcCPU()
 		end
 	end
 
-	self.vol.tex
-		:bind()
-		:subimage()
-		:unbind()
---	print('density range', valueRange)
+	self.valueGPUDirty = true	-- GPU is behind
+	self.valueRangeDirty = true	-- valueRange is behind
 end
 
 function App:recalcGPU()
-	self.computeShader	
+	self.computeShader
 		:use()
 		:setUniforms{
-			graphMin = self.graphSize.min.s,
-			graphMax = self.graphSize.max.s,
+			graphMin = self.graphBBox.min.s,
+			graphMax = self.graphBBox.max.s,
 			mandelMaxIter = self.mandelMaxIter,
 			mandelConst = self.mandelConst,
 			mandelEscapeNormSq = self.mandelEscapeNormSq,
@@ -260,26 +253,108 @@ function App:recalcGPU()
 
 	self.computeShader:useNone()
 
-	-- now copy back to data but only for the sake of calculating min/max
+	self.valueCPUDirty = true
+	self.valueRangeDirty = true
+end
+
+function App:flushValueCPUToGPU()
+	-- if GPU data is old then update it from CPU data
+	if not self.valueGPUDirty then return end
+print('flushValueCPUToGPU')
+	assert(not self.valueCPUDirty)
+	self.vol.tex
+		:bind()
+		:subimage()
+		:unbind()
+	self.valueGPUDirty = nil
+end
+
+function App:flushValueGPUToCPU()
+	if not self.valueCPUDirty then return end
+print('flushValueGPUToCPU')
+	assert(not self.valueGPUDirty)
 	local tex = self.vol.tex
 	tex:bind()
 	tex:toCPU()
 	tex:unbind()
+	self.valueCPUDirty = nil
 end
 
 function App:update()
 	gl.glClear(bit.bor(gl.GL_COLOR_BUFFER_BIT, gl.GL_DEPTH_BUFFER_BIT))
 
+	-- see if we should update our valueRange
+	if self.autoUpdateValueRange 	-- user requests update
+	and self.valueRangeDirty	-- values have been modified elsewhere
+	then
+		self:flushValueGPUToCPU()	-- do our reduce on the CPu, so make sure CPU is up to date
+print('flushValueRange')
+
+		-- [[ update the range data
+		-- this could be done much faster as a reduce kernel
+		-- I'm already doing it this way in my hydro-cl project
+		local valueRange = self.vol.valueRange
+		valueRange:set(math.huge, -math.huge)
+		local ptr = self.vol.data+0
+		for i=0,self.vol.size:volume()-1 do
+			valueRange.x = math.min(valueRange.x, ptr[0])
+			valueRange.y = math.max(valueRange.y, ptr[0])
+			ptr=ptr+1
+		end
+		--]]
+
+		self.valueRangeDirty = nil
+	end
+
+	-- see if we should update our GPU data before we draw
+	self:flushValueCPUToGPU()
+
+
 	self.cuboidWireframe:draw()
-	
+
 	self.vol:draw()
 
 
-	-- do mouse ray -> intersect with self.bbox
+	-- do mouse ray -> intersect with self.worldBBox
 	-- click to recenter on axis of side of click
 	-- click+drag to change bounds (TODO maintain aspect ratio?)
 	--print(self.mouse.pos)
 
+	if self.mouse.rightDown then
+		if self.mouse.deltaPos.x ~= 0
+		or self.mouse.deltaPos.y ~= 0
+		then
+			if self.leftShiftDown
+			or self.rightShiftDown
+			then
+				-- zoom volume
+				local dy = self.mouse.deltaPos.y
+				local center = self.graphBBox:center()
+				local newHalfSize = .5 * self.graphBBox:size() * math.exp(10 * dy)
+				self.graphBBox.max = center + newHalfSize
+				self.graphBBox.min = center - newHalfSize
+				self:recalc()
+			else
+				-- drag volume
+				local delta = (
+					  self.view.angle:xAxis() * self.mouse.deltaPos.x
+					+ self.view.angle:yAxis() * self.mouse.deltaPos.y
+				) * self.view.pos:length()
+
+				-- ... divide by volume 3D size
+				-- ... times by graph size
+				local graphSize = self.graphBBox:size()
+				local worldSize = self.worldBBox:size()
+				delta.x = delta.x * graphSize.x / worldSize.x
+				delta.y = delta.y * graphSize.y / worldSize.y
+				delta.z = delta.z * graphSize.z / worldSize.z
+				-- and now scroll in our graph bounds
+				self.graphBBox.min = self.graphBBox.min - delta
+				self.graphBBox.max = self.graphBBox.max - delta
+				self:recalc()
+			end
+		end
+	end
 
 	App.super.update(self)
 end
@@ -298,23 +373,29 @@ function App:updateGUI()
 				self.view.pos:set(0,0,self.viewDist)
 			end
 
-			if ig.igInputFloat('graph minX', self.graphSize.min.s + 0)
-			or ig.igInputFloat('graph minY', self.graphSize.min.s + 1)
-			or ig.igInputFloat('graph minZ', self.graphSize.min.s + 2)
-			or ig.igInputFloat('graph maxX', self.graphSize.max.s + 0)
-			or ig.igInputFloat('graph maxY', self.graphSize.max.s + 1)
-			or ig.igInputFloat('graph maxZ', self.graphSize.max.s + 2)
+			if ig.igInputFloat('graph minX', self.graphBBox.min.s + 0)
+			or ig.igInputFloat('graph minY', self.graphBBox.min.s + 1)
+			or ig.igInputFloat('graph minZ', self.graphBBox.min.s + 2)
+			or ig.igInputFloat('graph maxX', self.graphBBox.max.s + 0)
+			or ig.igInputFloat('graph maxY', self.graphBBox.max.s + 1)
+			or ig.igInputFloat('graph maxZ', self.graphBBox.max.s + 2)
 			or ig.luatableInputFloat('mandelConst', self, 'mandelConst')
 			or ig.luatableInputInt('mandelPerm', self, 'mandelPerm')
 			or ig.luatableInputInt('mandelMaxIter', self, 'mandelMaxIter')
-			or ig.luatableCheckbox('mandelEscapeNormSq', self, 'mandelEscapeNormSq')
+			or ig.luatableInputFloat('mandelEscapeNormSq', self, 'mandelEscapeNormSq')
 			or ig.luatableCheckbox('recalcWithCompute', self, 'recalcWithCompute')
 			then
 				self:recalc()
 			end
 
-			ig.igInputFloat('value min', self.vol.valueRange.s + 0)
-			ig.igInputFloat('value max', self.vol.valueRange.s + 1)
+			ig.luatableCheckbox('autoUpdateValueRange', self, 'autoUpdateValueRange')
+
+			if ig.igInputFloat('value min', self.vol.valueRange.s + 0)
+			or ig.igInputFloat('value max', self.vol.valueRange.s + 1)
+			then
+				self.valueRangeDirty = true
+				-- dirty means once we're on autoUpdateValueRange it will recalc
+			end
 
 			-- logDensity is normalized to this range [.x,.y], and then clamped to (0,1), and then scaled by .z
 			ig.igInputFloat('densityAlphaPeriod', self.vol.densityAlphaRange.s + 0)
@@ -324,15 +405,15 @@ function App:updateGUI()
 
 			ig.luatableSliderFloat('alpha', self.vol, 'alpha', 0, 1)
 			ig.luatableCheckbox('useLog', self.vol, 'useLog')
-	
--- [[
-			ig.igInputFloat('vol minX', self.bbox.min.s + 0)
-			ig.igInputFloat('vol minY', self.bbox.min.s + 1)
-			ig.igInputFloat('vol minZ', self.bbox.min.s + 2)
 
-			ig.igInputFloat('vol maxX', self.bbox.max.s + 0)
-			ig.igInputFloat('vol maxY', self.bbox.max.s + 1)
-			ig.igInputFloat('vol maxZ', self.bbox.max.s + 2)
+-- [[
+			ig.igInputFloat('vol minX', self.worldBBox.min.s + 0)
+			ig.igInputFloat('vol minY', self.worldBBox.min.s + 1)
+			ig.igInputFloat('vol minZ', self.worldBBox.min.s + 2)
+
+			ig.igInputFloat('vol maxX', self.worldBBox.max.s + 0)
+			ig.igInputFloat('vol maxY', self.worldBBox.max.s + 1)
+			ig.igInputFloat('vol maxZ', self.worldBBox.max.s + 2)
 --]]
 			ig.igEndMenu()
 		end
