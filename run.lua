@@ -16,11 +16,11 @@ function App:initGL()
 	App.super.initGL(self)
 
 	self.mandelConst = -.5
-	self.mandelPerm = 0	-- 0-3
+	self.mandelPerm = 2	-- 0-3
 
 
 	-- range in 3D space
-	self.volumeRange = box3f(
+	self.bbox = box3f(
 		{-1, -1, -1},
 		{1, 1, 1}
 	)
@@ -30,33 +30,33 @@ function App:initGL()
 		color = {.5, .5, .5, 1},
 	}
 	-- set it to update every frame
-	self.cuboidWireframe.globj.uniforms.mins = self.volumeRange.min.s
-	self.cuboidWireframe.globj.uniforms.maxs = self.volumeRange.max.s
+	self.cuboidWireframe.globj.uniforms.mins = self.bbox.min.s
+	self.cuboidWireframe.globj.uniforms.maxs = self.bbox.max.s
 
 
 	self.volumeRenderer = VolumeRenderer{
 		view = self.view,
-		useLog = true,
-		size = {64, 64, 64},
+		size = {128, 128, 128},
+		--useLog = true,
 	}
-	self.densityData = self.volumeRenderer.data
-	self:recalc()
 	-- set it to update every frame
-	self.volumeRenderer.globj.uniforms.mins = self.volumeRange.min.s
-	self.volumeRenderer.globj.uniforms.maxs = self.volumeRange.max.s
-
+	self.volumeRenderer.globj.uniforms.mins = self.bbox.min.s
+	self.volumeRenderer.globj.uniforms.maxs = self.bbox.max.s
+	
+	self.graphSize = box3f({-2, -2, -2}, {2, 2, 2})
+	self:recalc()
+	
 	gl.glEnable(gl.GL_DEPTH_TEST)
-	gl.glDepthFunc(gl.GL_LEQUAL)	-- for the wireframe
 end
 
 function App:recalc()
-	local b = box3f({-2, -2, -2}, {2, 2, 2})
-	local ptr = self.densityData+0
+	local b = self.graphSize
+	local ptr = self.volumeRenderer.data+0
 	local fw = self.mandelConst
 	local perm = self.mandelPerm
-print('perm', perm)	-- I'm not seeing a difference	
-	local densityRange = self.volumeRenderer.densityRange
-	densityRange:set(math.huge, -math.huge)
+--print('perm', perm)	-- I'm not seeing a difference	
+	local valueRange = self.volumeRenderer.valueRange
+	valueRange:set(math.huge, -math.huge)
 	local size = self.volumeRenderer.size
 	for k=0,size.z-1 do
 		local fz = (k+.5)/tonumber(size.z) * (b.max.z - b.min.z) + b.min.z
@@ -83,8 +83,8 @@ print('perm', perm)	-- I'm not seeing a difference
 					local zn = zr*zr + zi*zi
 					if zn > 4 then
 						ptr[0] = iter
-						densityRange.x = math.min(densityRange.x, iter)
-						densityRange.y = math.max(densityRange.y, iter)
+						valueRange.x = math.min(valueRange.x, iter)
+						valueRange.y = math.max(valueRange.y, iter)
 						break
 					end
 				end
@@ -98,11 +98,8 @@ print('perm', perm)	-- I'm not seeing a difference
 		:bind()
 		:subimage()
 		:unbind()
-
-	print('density range', densityRange)
+--	print('density range', valueRange)
 end
-
-
 
 function App:update()
 	gl.glClear(bit.bor(gl.GL_COLOR_BUFFER_BIT, gl.GL_DEPTH_BUFFER_BIT))
@@ -110,6 +107,13 @@ function App:update()
 	self.cuboidWireframe:draw()
 	
 	self.volumeRenderer:draw()
+
+
+	-- do mouse ray -> intersect with self.bbox
+	-- click to recenter on axis of side of click
+	-- click+drag to change bounds (TODO maintain aspect ratio?)
+	--print(self.mouse.pos)
+
 
 	App.super.update(self)
 end
@@ -119,6 +123,7 @@ function App:updateGUI()
 		if ig.igBeginMenu'menu' then
 
 			ig.luatableCheckbox('ortho', self.view, 'ortho')
+
 			if ig.igButton'reset view' then
 				self.view.ortho = true
 				self.view.orthoSize = self.viewOrthoSize
@@ -127,8 +132,18 @@ function App:updateGUI()
 				self.view.pos:set(0,0,self.viewDist)
 			end
 
-			ig.igInputFloat('densityMin', self.volumeRenderer.densityRange.s + 0)
-			ig.igInputFloat('densityMax', self.volumeRenderer.densityRange.s + 1)
+			if ig.igInputFloat('graph minX', self.graphSize.min.s + 0)
+			or ig.igInputFloat('graph minY', self.graphSize.min.s + 1)
+			or ig.igInputFloat('graph minZ', self.graphSize.min.s + 2)
+			or ig.igInputFloat('graph maxX', self.graphSize.max.s + 0)
+			or ig.igInputFloat('graph maxY', self.graphSize.max.s + 1)
+			or ig.igInputFloat('graph maxZ', self.graphSize.max.s + 2)
+			then
+				self:recalc()
+			end
+
+			ig.igInputFloat('value min', self.volumeRenderer.valueRange.s + 0)
+			ig.igInputFloat('value max', self.volumeRenderer.valueRange.s + 1)
 
 			-- logDensity is normalized to this range [.x,.y], and then clamped to (0,1), and then scaled by .z
 			ig.igInputFloat('densityAlphaPeriod', self.volumeRenderer.densityAlphaRange.s + 0)
@@ -142,16 +157,17 @@ function App:updateGUI()
 				self:recalc()
 			end
 
+			ig.luatableSliderFloat('alpha', self.volumeRenderer, 'alpha', 0, 1)
 			ig.luatableCheckbox('useLog', self.volumeRenderer, 'useLog')
 	
 -- [[
-			ig.igInputFloat('minX', self.volumeRange.min.s + 0)
-			ig.igInputFloat('minY', self.volumeRange.min.s + 1)
-			ig.igInputFloat('minZ', self.volumeRange.min.s + 2)
+			ig.igInputFloat('vol minX', self.bbox.min.s + 0)
+			ig.igInputFloat('vol minY', self.bbox.min.s + 1)
+			ig.igInputFloat('vol minZ', self.bbox.min.s + 2)
 
-			ig.igInputFloat('maxX', self.volumeRange.max.s + 0)
-			ig.igInputFloat('maxY', self.volumeRange.max.s + 1)
-			ig.igInputFloat('maxZ', self.volumeRange.max.s + 2)
+			ig.igInputFloat('vol maxX', self.bbox.max.s + 0)
+			ig.igInputFloat('vol maxY', self.bbox.max.s + 1)
+			ig.igInputFloat('vol maxZ', self.bbox.max.s + 2)
 --]]
 			ig.igEndMenu()
 		end

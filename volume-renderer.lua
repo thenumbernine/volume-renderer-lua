@@ -22,7 +22,7 @@ local glnumber = require 'gl.number'
 local float = ffi.typeof'float'
 
 
-local logDensityEpsilon = 1e-5
+local logRangeEpsilon = 1e-5
 
 local VolumeRenderer = class()
 
@@ -38,7 +38,7 @@ args:
 	ctype = c type (TODO derive this from the internalFormat GL type)
 		(TODO derive from data type?)
 	internalFormat = GL internalFormat to use (TODO derive from ctype or from data?)
-	view = where to get mvProjMat from
+	view = where to get mvMat and projMat from
 	mins = (optional) bbox min
 	maxs = (optional) bbox max
 	useLog
@@ -79,6 +79,11 @@ print'allocating new data'
 			'gl.types.gltypeForCType'
 		)
 		-- 2) find internalFormat for GL type
+		--
+		-- TODO TODO right now the shader is designed only for single-channel texture internal formats.
+		-- If I keep doing it this way then I just need one single mapping here from c-type to internalFormat
+		-- If I adopt a different way with multiple channels then I'll need a way to make the shader code more modular
+		--
 		-- TODO save names in gl.tex.formatInfos, for easier error reporting?
 		local formatInfo = select(2, GLTex3D.formatInfos:find(nil, function(info)
 			return info.types
@@ -107,18 +112,20 @@ print'allocating new data'
 
 
 	self.useLog = args.useLog
+	self.alpha = tonumber(args.alpha) or .1
 	self.view = assert.index(args, 'view')
 
-	-- densityRange holds the density range
-	-- logDensityRange holds the log-mapped density range
-	-- either is used as a uniform depending on whether useLog is set
-	self.densityRange = vec2f()
-
-	self.logDensityRange = vec2f()
-
-
 	-- .x = period, .y = offset, .z = gamma
-	self.densityAlphaRange = vec3f(2, 0, 4)	
+	self.densityAlphaRange = vec3f(3, 0, 100)	
+
+	-- valueRange holds the density range
+	-- logValueRange holds the log-mapped density range
+	-- either is used as a uniform depending on whether useLog is set
+	self.valueRange = vec2f()
+
+	self.logValueRange = vec2f()
+
+
 
 
 
@@ -188,6 +195,8 @@ print'allocating new data'
 	self.globj.attrs.vertex.buffer = self.globj.vertexes
 	self.globj.geometry.count = #self.globj.vertexes.vec
 --]]
+	self.surfaceNormal = vec3f()
+	self.viewPos = vec3f()	-- glapp.view uses double so ....
 
 	local volumeVtxGPU = self.vtxGPUsPerSide[1]
 	self.globj = GLSceneObject{
@@ -196,48 +205,64 @@ print'allocating new data'
 			precision = 'best',
 			vertexCode = [[
 layout(location=0) in vec3 vertex;
-layout(location=0) out vec3 tc;
+out vec3 worldVtx;	// in range [mins,maxs]
+out vec3 tc;	// in range [0,1]^3
 
-uniform mat4 mvProjMat;
+uniform mat4 mvMat;
+uniform mat4 projMat;
+
 uniform vec3 mins, maxs;
 
 void main() {
 	tc = vertex;
-	gl_Position = mvProjMat * vec4(
-		mix(mins, maxs, vertex),
-		1.
-	);
+	worldVtx = mix(mins, maxs, vertex);
+	vec4 viewVtx = mvMat * vec4(worldVtx, 1.);
+	gl_Position = projMat * viewVtx;
 }
 ]],
 			fragmentCode = [[
 precision highp sampler3D;
-layout(location=0) in vec3 tc;
+in vec3 tc;	// in range [0,1]^3
+in vec3 worldVtx;	// in range [mins,maxs]
 layout(location=0) out vec4 fragColor;
 
 uniform sampler3D tex;
 uniform sampler2D hsvTex;
-uniform vec2 densityRange;
+
+uniform vec3 viewPos;			// position in world space of the view
+uniform vec3 surfaceNormal;		// normal in world space of the boundary / slices / cube
+
+uniform vec2 valueRange;
 uniform vec3 densityAlphaRange;	// x = freq, y = offset, z = gamma
 uniform bool useLog;
+uniform float alpha;
 
-#define logDensityEpsilon ]]..glnumber(logDensityEpsilon)..[[ 
+#define logRangeEpsilon ]]..glnumber(logRangeEpsilon)..[[ 
 
 float fpart(float x) {
 	return x - floor(x);
 }
 
 void main() {
+	// viewDir = normalized, world-space vector through the volume
+	vec3 viewDir = normalize(worldVtx - viewPos);
+	viewDir /= vec3(textureSize(tex, 0));
+
+	// how far the normalized-view-direction passes in the direction perpendicular to the viewed surface
+	float step = dot(viewDir, surfaceNormal);
+
 	float density = texture(tex, tc).r;
 	if (useLog) {
-		density = log(density + logDensityEpsilon);
+		density = log(density + logRangeEpsilon);
 	}
-	float gradLookup = (density - densityRange.x) / (densityRange.y - densityRange.x);
+	// assume valueRange has already had log() applied
+	float gradLookup = (density - valueRange.x) / (valueRange.y - valueRange.x);
 
 	fragColor = texture(hsvTex, vec2(gradLookup, .5));
 	fragColor.a = pow(
 		fpart(density / densityAlphaRange.x + densityAlphaRange.y),
-		densityAlphaRange.z
-	);
+		densityAlphaRange.z * step
+	) * alpha;
 }
 ]],
 			uniforms = {
@@ -247,6 +272,7 @@ void main() {
 				mins = args.mins or {-1,-1,-1},
 				maxs = args.maxs or {1,1,1},
 				useLog = self.useLog,
+				alpha = self.alpha,
 			},
 		},
 		geometry = {
@@ -261,7 +287,10 @@ void main() {
 		-- GLSceneObject uniforms update every frame:
 		uniforms = {
 			densityAlphaRange = self.densityAlphaRange.s,
-			mvProjMat = self.view.mvProjMat.ptr,
+			mvMat = self.view.mvMat.ptr,
+			projMat = self.view.projMat.ptr,
+			viewPos = self.viewPos.s,
+			surfaceNormal = self.surfaceNormal.s,
 		},
 	}
 end
@@ -269,8 +298,14 @@ end
 function VolumeRenderer:draw()
 	local fwd = self.view.angle:zAxis()
 	local absfwd = fwd:map(math.abs)
-	local maxdir = select(2, table.sup{absfwd:unpack()})-1
-	local vtxGPUIndex = maxdir + (fwd.s[maxdir] > 0 and 3 or 0)
+	local maxDirAxis = select(2, table.sup{absfwd:unpack()})-1
+assert.le(0,maxDirAxis)
+assert.le(maxDirAxis,2)
+	local vtxGPUIndex = maxDirAxis + (fwd.s[maxDirAxis] > 0 and 3 or 0)
+	
+	self.surfaceNormal.x, self.surfaceNormal.y, self.surfaceNormal.z = 0, 0, 0
+	self.surfaceNormal.s[maxDirAxis] = fwd.s[maxDirAxis] > 0 and -1 or 1
+
 	local vtxGPU = self.vtxGPUsPerSide[1+vtxGPUIndex]
 	local lastVtxGPU = self.globj.vertexes
 	if vtxGPU ~= lastVtxGPU then
@@ -290,16 +325,25 @@ function VolumeRenderer:draw()
 	gl.glDepthMask(gl.GL_FALSE)
 	gl.glEnable(gl.GL_BLEND)
 	gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+
+	self.viewPos:set(self.view.pos:unpack())
 	
 	if self.useLog then
-		self.logDensityRange.x = math.log(self.densityRange.x + logDensityEpsilon) 
-		self.logDensityRange.y = math.log(self.densityRange.y + logDensityEpsilon) 
-		self.globj.uniforms.densityRange = self.logDensityRange.s
+		self.logValueRange.x = math.log(self.valueRange.x + logRangeEpsilon) 
+		self.logValueRange.y = math.log(self.valueRange.y + logRangeEpsilon) 
+		self.globj.uniforms.valueRange = self.logValueRange.s
 	else
-		self.globj.uniforms.densityRange = self.densityRange.s
+		self.globj.uniforms.valueRange = self.valueRange.s
 	end
+	self.globj.uniforms.useLog = self.useLog
+	self.globj.uniforms.alpha = self.alpha
+
+	-- how long will each ray step between slices?
+	-- view fwd line is going to vary at each point (based on frustum)
+	-- 1/size.xyz * 1/(view fwd line dot fwd normal) = how far through each xyz dimension to travel 
 
 	self.globj:draw()
+
 	gl.glDisable(gl.GL_BLEND)
 	gl.glDepthMask(gl.GL_TRUE)
 end
