@@ -125,7 +125,7 @@ void main() {
 
 	vec3 texSize = vec3(256, 256, 256);
 	dvec4 f = dvec4(
-		vec3(itc) / texSize * (graphMax - graphMin) + graphMin,
+		mix(graphMin, graphMax, vec3(itc) / texSize),
 		mandelConst
 	);
 	dvec2 z, c;
@@ -162,12 +162,9 @@ void main() {
 		}),
 	}
 		:bindImage(
-			0,	-- binding
+			0,					-- binding
 			self.vol.tex,		-- tex
-			gl.GL_WRITE_ONLY,	-- read/write
-			nil,				-- format from texture
-			nil,				-- level = 0
-			gl.GL_TRUE			-- tex3D must be layered https://www.khronos.org/opengl/wiki/Image_Load_Store
+			gl.GL_WRITE_ONLY	-- read/write
 		)
 		:useNone()
 
@@ -256,18 +253,17 @@ function App:recalcGPU()
 			mandelEscapeNormSq = self.mandelEscapeNormSq,
 			mandelPerm = self.mandelPerm,
 		}
+		:dispatchCompute(self.computeNumGroups:unpack())
 
-	gl.glDispatchCompute(self.computeNumGroups:unpack())
-
+	-- should memory barrier be a GLProgram function or nah?
 	gl.glMemoryBarrier(gl.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
 
 	self.computeShader:useNone()
 
-
 	-- now copy back to data but only for the sake of calculating min/max
 	local tex = self.vol.tex
-	-- TODO change this to ... 1) accept ptr, 2) default ptr to self.data, 3) return self
-	tex:toCPU(self.vol.data)
+	tex:bind()
+	tex:toCPU()
 	tex:unbind()
 end
 
