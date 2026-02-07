@@ -21,6 +21,7 @@ function App:initGL()
 	self.mandelMaxIter = 20
 	self.mandelConst = -.5
 	self.mandelPerm = 2	-- 0-3
+	self.mandelEscapeNormSq = 4
 	self.recalcWithCompute = not cmdline.recalcWithCPU
 
 
@@ -39,20 +40,20 @@ function App:initGL()
 	self.cuboidWireframe.globj.uniforms.maxs = self.bbox.max.s
 
 
-	self.volumeRenderer = VolumeRenderer{
+	-- TODO allow it to be passed its own GLTex3D as well
+	self.vol = VolumeRenderer{
 		view = self.view,
-		size = {4,4,4}, --{256, 256, 256},
+		--size = {4,4,4}, 
+		size = {256, 256, 256},
 		--useLog = true,
 	}
-print('vol tex ctype', self.volumeRenderer.ctype)
-print('vol tex format', self.volumeRenderer.tex:getFormatInfo().glslFormatName)	
 
 	-- set it to update every frame
-	self.volumeRenderer.globj.uniforms.mins = self.bbox.min.s
-	self.volumeRenderer.globj.uniforms.maxs = self.bbox.max.s
+	self.vol.globj.uniforms.mins = self.bbox.min.s
+	self.vol.globj.uniforms.maxs = self.bbox.max.s
 
 	self.graphSize = box3f({-1, -1, -1}, {1, 1, 1})
-	
+
 
 	-- prepare our mandelbrot calc compute shader
 
@@ -77,28 +78,28 @@ print('vol tex format', self.volumeRenderer.tex:getFormatInfo().glslFormatName)
 		return 2^math.floor(math.log(x, 2))
 	end
 
-	print('computeSize', self.volumeRenderer.size)
+	print('computeSize', self.vol.size)
 
 	-- product must be <= GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS 
 	self.computeLocalSize = vec3i()
 	self.computeLocalSize.x = math.min(
-		self.volumeRenderer.size.x,
+		self.vol.size.x,
 		roundPow2(tonumber(maxComputeWorkGroupInvocations)^(1/3))
 	)
 	self.computeLocalSize.y = math.min(
-		self.volumeRenderer.size.y,
+		self.vol.size.y,
 		roundPow2(math.sqrt(tonumber(maxComputeWorkGroupInvocations / self.computeLocalSize.x)))
 	)
 	self.computeLocalSize.z = math.min(
-		self.volumeRenderer.size.z,
+		self.vol.size.z,
 		maxComputeWorkGroupInvocations / (self.computeLocalSize.x * self.computeLocalSize.y)
 	)
 	print('computeLocalSize', self.computeLocalSize)
 
-	self.computeNumGroups = self.volumeRenderer.size / self.computeLocalSize
+	self.computeNumGroups = self.vol.size / self.computeLocalSize
 	print('computeNumGroups', self.computeNumGroups)
 	-- TODO this assertion is not necessary, but if it fails that means I will have to add bounds-checking of the index to the kernels.	
-	assert.eq(self.computeNumGroups:elemMul(self.computeLocalSize), self.volumeRenderer.size)
+	assert.eq(self.computeNumGroups:elemMul(self.computeLocalSize), self.vol.size)
 
 	self.computeShader = GLProgram{
 		version = 'latest',
@@ -111,18 +112,20 @@ layout(local_size_x=<?=computeLocalSize.x
 
 layout(<?=texFormat?>, binding=0) uniform writeonly image3D dstTex;
 
-const vec3 mins = vec3(-1, -1, -1);
-const vec3 maxs = vec3(1, 1, 1);
-const float mandelMaxIter = 20.;	// TODO mandelMaxIter
-const double mandelConst = -.5;
-const int mandelPerm = 2;	// TOOD mandelPerm
+uniform vec3 graphMin;// = vec3(-1, -1, -1);
+uniform vec3 graphMax;// = vec3(1, 1, 1);
+uniform float mandelMaxIter;// = 20.;	// TODO mandelMaxIter
+uniform double mandelConst;// = -.5;
+uniform double mandelEscapeNormSq;// = 4.;
+uniform int mandelPerm;// = 2;	// TOOD mandelPerm
+
 
 void main() {
 	ivec3 itc = ivec3(gl_GlobalInvocationID.xyz);
 
 	vec3 texSize = vec3(256, 256, 256);
 	dvec4 f = dvec4(
-		vec3(itc) / texSize * (maxs - mins) + mins,
+		vec3(itc) / texSize * (graphMax - graphMin) + graphMin,
 		mandelConst
 	);
 	dvec2 z, c;
@@ -145,20 +148,27 @@ void main() {
 	for (; iter < mandelMaxIter; iter += 1.) {
 		z = dvec2(
 			z.x*z.x - z.y*z.y + c.x,
-			2.*z.x*z.x + c.y
+			2.*z.x*z.y + c.y
 		);
 		double zn = dot(z,z);
-		if (zn > 4.) break;
+		if (zn > mandelEscapeNormSq) break;
 	}
 
-	imageStore(dstTex, itc, vec4(iter, 0., 0., 1.));
+	imageStore(dstTex, itc, vec4(iter, 0., 0., 0.));
 }
 ]], 	{
 			computeLocalSize = self.computeLocalSize,
-			texFormat = self.volumeRenderer.tex:getFormatInfo().glslFormatName,
-		})
+			texFormat = self.vol.tex:getFormatInfo().glslFormatName,
+		}),
 	}
-		:bindImage(0, self.volumeRenderer.tex, gl.GL_WRITE_ONLY)
+		:bindImage(
+			0,	-- binding
+			self.vol.tex,		-- tex
+			gl.GL_WRITE_ONLY,	-- read/write
+			nil,				-- format from texture
+			nil,				-- level = 0
+			gl.GL_TRUE			-- tex3D must be layered https://www.khronos.org/opengl/wiki/Image_Load_Store
+		)
 		:useNone()
 
 	self:recalc()
@@ -166,12 +176,107 @@ void main() {
 	gl.glEnable(gl.GL_DEPTH_TEST)
 end
 
+function App:recalc()
+	if self.recalcWithCompute then
+		self:recalcGPU()
+	else
+		self:recalcCPU()
+	end
+
+	-- [[ update the range data
+	-- this could be done much faster as a reduce kernel
+	-- I'm already doing it this way in my hydro-cl project
+	local valueRange = self.vol.valueRange
+	valueRange:set(math.huge, -math.huge)
+	local ptr = self.vol.data+0
+	for i=0,self.vol.size:volume()-1 do
+		valueRange.x = math.min(valueRange.x, ptr[0])
+		valueRange.y = math.max(valueRange.y, ptr[0])
+		ptr=ptr+1	
+	end
+	--]]
+end
+
+function App:recalcCPU()
+	local b = self.graphSize
+	local ptr = self.vol.data+0
+	local fw = self.mandelConst
+	local mandelPerm = self.mandelPerm
+	local mandelEscapeNormSq = self.mandelEscapeNormSq
+	local size = self.vol.size
+	for k=0,size.z-1 do
+		local fz = (k+.5)/tonumber(size.z) * (b.max.z - b.min.z) + b.min.z
+		for j=0,size.y-1 do
+			local fy = (j+.5)/tonumber(size.y) * (b.max.y - b.min.y) + b.min.y
+			for i=0,size.x-1 do
+				local fx = (i+.5)/tonumber(size.x) * (b.max.x - b.min.x) + b.min.x
+				
+				-- mandelbrot init is z={0,0}, c={x,y}
+				-- julia init is z={x,y}, c=fixed
+				local zr, zi, cr, ci = 0,0,0,0
+				if mandelPerm == 0 then
+					zr, zi, cr, ci = fw, fx, fy, fz
+				elseif mandelPerm == 1 then
+					zr, zi, cr, ci = fz, fw, fx, fy
+				elseif mandelPerm == 2 then
+					zr, zi, cr, ci = fy, fz, fw, fx
+				elseif mandelPerm == 3 then
+					zr, zi, cr, ci = fx, fy, fz, fw
+				end
+	
+				for iter=0,self.mandelMaxIter do
+					zr, zi = zr*zr - zi*zi + cr, 2*zr*zi + ci
+					local zn = zr*zr + zi*zi
+					if zn > mandelEscapeNormSq then
+						ptr[0] = iter
+						break
+					end
+				end
+
+				ptr=ptr+1
+			end
+		end
+	end
+
+	self.vol.tex
+		:bind()
+		:subimage()
+		:unbind()
+--	print('density range', valueRange)
+end
+
+function App:recalcGPU()
+	self.computeShader	
+		:use()
+		:setUniforms{
+			graphMin = self.graphSize.min.s,
+			graphMax = self.graphSize.max.s,
+			mandelMaxIter = self.mandelMaxIter,
+			mandelConst = self.mandelConst,
+			mandelEscapeNormSq = self.mandelEscapeNormSq,
+			mandelPerm = self.mandelPerm,
+		}
+
+	gl.glDispatchCompute(self.computeNumGroups:unpack())
+
+	gl.glMemoryBarrier(gl.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
+
+	self.computeShader:useNone()
+
+
+	-- now copy back to data but only for the sake of calculating min/max
+	local tex = self.vol.tex
+	-- TODO change this to ... 1) accept ptr, 2) default ptr to self.data, 3) return self
+	tex:toCPU(self.vol.data)
+	tex:unbind()
+end
+
 function App:update()
 	gl.glClear(bit.bor(gl.GL_COLOR_BUFFER_BIT, gl.GL_DEPTH_BUFFER_BIT))
 
 	self.cuboidWireframe:draw()
 	
-	self.volumeRenderer:draw()
+	self.vol:draw()
 
 
 	-- do mouse ray -> intersect with self.bbox
@@ -206,22 +311,23 @@ function App:updateGUI()
 			or ig.luatableInputFloat('mandelConst', self, 'mandelConst')
 			or ig.luatableInputInt('mandelPerm', self, 'mandelPerm')
 			or ig.luatableInputInt('mandelMaxIter', self, 'mandelMaxIter')
+			or ig.luatableCheckbox('mandelEscapeNormSq', self, 'mandelEscapeNormSq')
 			or ig.luatableCheckbox('recalcWithCompute', self, 'recalcWithCompute')
 			then
 				self:recalc()
 			end
 
-			ig.igInputFloat('value min', self.volumeRenderer.valueRange.s + 0)
-			ig.igInputFloat('value max', self.volumeRenderer.valueRange.s + 1)
+			ig.igInputFloat('value min', self.vol.valueRange.s + 0)
+			ig.igInputFloat('value max', self.vol.valueRange.s + 1)
 
 			-- logDensity is normalized to this range [.x,.y], and then clamped to (0,1), and then scaled by .z
-			ig.igInputFloat('densityAlphaPeriod', self.volumeRenderer.densityAlphaRange.s + 0)
-			ig.igSliderFloat('densityAlphaOffset', self.volumeRenderer.densityAlphaRange.s + 1, 0, 1)
-			ig.igInputFloat('densityAlphaGamma', self.volumeRenderer.densityAlphaRange.s + 2)
+			ig.igInputFloat('densityAlphaPeriod', self.vol.densityAlphaRange.s + 0)
+			ig.igSliderFloat('densityAlphaOffset', self.vol.densityAlphaRange.s + 1, 0, 1)
+			ig.igInputFloat('densityAlphaGamma', self.vol.densityAlphaRange.s + 2)
 
 
-			ig.luatableSliderFloat('alpha', self.volumeRenderer, 'alpha', 0, 1)
-			ig.luatableCheckbox('useLog', self.volumeRenderer, 'useLog')
+			ig.luatableSliderFloat('alpha', self.vol, 'alpha', 0, 1)
+			ig.luatableCheckbox('useLog', self.vol, 'useLog')
 	
 -- [[
 			ig.igInputFloat('vol minX', self.bbox.min.s + 0)
@@ -236,110 +342,6 @@ function App:updateGUI()
 		end
 		ig.igEndMainMenuBar()
 	end
-end
-
-
-function App:recalc()
-	if self.recalcWithCompute then
-		self:recalcGPU()
-	else
-		self:recalcCPU()
-	end
-
-	print'data:'
-	for i=0,self.volumeRenderer.size:volume()-1 do
-		io.write('\t', self.volumeRenderer.data[i])
-		if bit.band(i, 15) == 15 then print() end
-	end
-	print()
-
-	-- [[ update the data
-	-- this could be done much faster as a reduce kernel
-	-- I'm already doing it this way in my hydro-cl project
-	local valueRange = self.volumeRenderer.valueRange
-	valueRange:set(math.huge, -math.huge)
-	local ptr = self.volumeRenderer.data+0
-	for i=0,self.volumeRenderer.size:volume()-1 do
-		valueRange.x = math.min(valueRange.x, ptr[0])
-		valueRange.y = math.max(valueRange.y, ptr[0])
-		ptr=ptr+1	
-	end
-	--]]
-end
-
-function App:recalcCPU()
-	local b = self.graphSize
-	local ptr = self.volumeRenderer.data+0
-	local fw = self.mandelConst
-	local perm = self.mandelPerm
---print('perm', perm)	-- I'm not seeing a difference	
-	local size = self.volumeRenderer.size
-	for k=0,size.z-1 do
-		local fz = (k+.5)/tonumber(size.z) * (b.max.z - b.min.z) + b.min.z
-		for j=0,size.y-1 do
-			local fy = (j+.5)/tonumber(size.y) * (b.max.y - b.min.y) + b.min.y
-			for i=0,size.x-1 do
-				local fx = (i+.5)/tonumber(size.x) * (b.max.x - b.min.x) + b.min.x
-				
-				-- mandelbrot init is z={0,0}, c={x,y}
-				-- julia init is z={x,y}, c=fixed
-				local zr, zi, cr, ci = 0,0,0,0
-				if perm == 0 then
-					zr, zi, cr, ci = fw, fx, fy, fz
-				elseif perm == 1 then
-					zr, zi, cr, ci = fz, fw, fx, fy
-				elseif perm == 2 then
-					zr, zi, cr, ci = fy, fz, fw, fx
-				elseif perm == 3 then
-					zr, zi, cr, ci = fx, fy, fz, fw
-				end
-	
-				for iter=0,self.mandelMaxIter do
-					zr, zi = zr*zr - zi*zi + cr, 2*zr*zi + ci
-					local zn = zr*zr + zi*zi
-					if zn > 4 then
-						ptr[0] = iter
-						break
-					end
-				end
-
-				ptr=ptr+1
-			end
-		end
-	end
-
-	self.volumeRenderer.tex
-		:bind()
-		:subimage()
-		:unbind()
---	print('density range', valueRange)
-end
-
-function App:recalcGPU()
-	self.computeShader	
-		:use()
-
-	gl.glDispatchCompute(self.computeNumGroups:unpack())
-
-	-- this says wait until compute is done writing?
-	gl.glMemoryBarrier(gl.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
-
-	self.computeShader:useNone()
-
-	-- now that it's done .... where's the data?
-	-- TODO TODO update GLTex.toCPU to not bind at first, 
-	--  and to default to .data
-	local tex = self.volumeRenderer.tex
-	--[[
-	tex:toCPU(self.volumeRenderer.data)
-	tex:unbind()
-	--]]
-	-- [[ maybe I need a FBO or something?
-	gl.glPixelStorei(gl.GL_PACK_ALIGNMENT, 1)
-	tex:bind()
-	gl.glGetTexImage(gl.GL_TEXTURE_3D, 0, gl.GL_RED, gl.GL_FLOAT, ffi.cast('char*', self.volumeRenderer.data))
-	tex:unbind()
-	--]]
 end
 
 return App():run()

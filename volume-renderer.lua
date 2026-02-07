@@ -141,6 +141,7 @@ function VolumeRenderer:init(args)
 		wrap = {
 			s = gl.GL_CLAMP_TO_EDGE,
 			t = gl.GL_CLAMP_TO_EDGE,
+			r = gl.GL_CLAMP_TO_EDGE,
 		},
 	}:unbind()
 
