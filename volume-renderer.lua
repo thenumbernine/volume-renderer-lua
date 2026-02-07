@@ -60,11 +60,11 @@ function VolumeRenderer:init(args)
 		-- should we query for args.internalFormat or just use float?
 		self.ctype = float
 	end
-print('ctype', self.ctype)
+--DEBUG:print('ctype', self.ctype)
 
 	-- if we weren't given data then allocate it
 	if not self.data then
-print'allocating new data'
+--DEBUG:print'allocating new data'
 		self.data = ffi.new(ffi.typeof('$[?]', self.ctype), self.size:volume())
 		self.owns = true	-- does it matter?  meh?
 	end

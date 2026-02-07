@@ -7,7 +7,6 @@ local cmdline = require 'ext.cmdline'(...)
 local vec3i = require 'vec-ffi.vec3i'
 local box3f = require 'vec-ffi.box3f'
 local gl = require 'gl.setup'(cmdline.gl)
-local GLTex = require 'gl.tex'
 local GLProgram = require 'gl.program'
 local ig = require 'imgui'
 local CuboidWireframe = require 'volume-renderer.cuboid-wireframe'
@@ -22,7 +21,7 @@ function App:initGL()
 	self.mandelMaxIter = 20
 	self.mandelConst = -.5
 	self.mandelPerm = 2	-- 0-3
-	self.recalcWithCompute = true
+	self.recalcWithCompute = not cmdline.recalcWithCPU
 
 
 	-- range in 3D space
@@ -42,9 +41,12 @@ function App:initGL()
 
 	self.volumeRenderer = VolumeRenderer{
 		view = self.view,
-		size = {256, 256, 256},
+		size = {4,4,4}, --{256, 256, 256},
 		--useLog = true,
 	}
+print('vol tex ctype', self.volumeRenderer.ctype)
+print('vol tex format', self.volumeRenderer.tex:getFormatInfo().glslFormatName)	
+
 	-- set it to update every frame
 	self.volumeRenderer.globj.uniforms.mins = self.bbox.min.s
 	self.volumeRenderer.globj.uniforms.maxs = self.bbox.max.s
@@ -70,16 +72,33 @@ function App:initGL()
 	local maxComputeWorkGroupInvocations = GLGlobal:get'GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS'
 	print('GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS = '..maxComputeWorkGroupInvocations)
 
+	local function roundPow2(x)
+		-- lazy way to round to nearest power-of-two
+		return 2^math.floor(math.log(x, 2))
+	end
+
+	print('computeSize', self.volumeRenderer.size)
+
 	-- product must be <= GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS 
 	self.computeLocalSize = vec3i()
-	self.computeLocalSize.x = 
-		-- lazy way to round to nearest power-of-two
-		2^math.floor(math.log(
-			tonumber(maxComputeWorkGroupInvocations)^(1/3),
-		2))
-	self.computeLocalSize.y = self.computeLocalSize.x
-	self.computeLocalSize.z = maxComputeWorkGroupInvocations / (self.computeLocalSize.x * self.computeLocalSize.y)
+	self.computeLocalSize.x = math.min(
+		self.volumeRenderer.size.x,
+		roundPow2(tonumber(maxComputeWorkGroupInvocations)^(1/3))
+	)
+	self.computeLocalSize.y = math.min(
+		self.volumeRenderer.size.y,
+		roundPow2(math.sqrt(tonumber(maxComputeWorkGroupInvocations / self.computeLocalSize.x)))
+	)
+	self.computeLocalSize.z = math.min(
+		self.volumeRenderer.size.z,
+		maxComputeWorkGroupInvocations / (self.computeLocalSize.x * self.computeLocalSize.y)
+	)
 	print('computeLocalSize', self.computeLocalSize)
+
+	self.computeNumGroups = self.volumeRenderer.size / self.computeLocalSize
+	print('computeNumGroups', self.computeNumGroups)
+	-- TODO this assertion is not necessary, but if it fails that means I will have to add bounds-checking of the index to the kernels.	
+	assert.eq(self.computeNumGroups:elemMul(self.computeLocalSize), self.volumeRenderer.size)
 
 	self.computeShader = GLProgram{
 		version = 'latest',
@@ -90,8 +109,7 @@ layout(local_size_x=<?=computeLocalSize.x
 	?>, local_size_z=<?=computeLocalSize.z
 	?>) in;
 
-// TODO infer 'r32f' form self.volumeRenderer.tex.internalFormat
-layout(<?=texInternalFormat?>, binding=0) uniform writeonly image3D dstTex;
+layout(<?=texFormat?>, binding=0) uniform writeonly image3D dstTex;
 
 const vec3 mins = vec3(-1, -1, -1);
 const vec3 maxs = vec3(1, 1, 1);
@@ -133,31 +151,15 @@ void main() {
 		if (zn > 4.) break;
 	}
 
-	imageStore(dstTex, itc, vec4(iter, 0., 0., 0.));
+	imageStore(dstTex, itc, vec4(iter, 0., 0., 1.));
 }
 ]], 	{
 			computeLocalSize = self.computeLocalSize,
-			texInternalFormat = GLTex.formatInfoForInternalFormat[
-				self.volumeRenderer.internalFormat
-			].glslFormatName,
+			texFormat = self.volumeRenderer.tex:getFormatInfo().glslFormatName,
 		})
 	}
-		:bindImage(
-			0,
-			self.volumeRenderer.tex,
-			self.volumeRenderer.internalFormat,
-			gl.GL_WRITE_ONLY)
+		:bindImage(0, self.volumeRenderer.tex, gl.GL_WRITE_ONLY)
 		:useNone()
-
-	-- is vec-ffi division per-element?
-	self.computeNumGroups = self.volumeRenderer.size / self.computeLocalSize
-	print('computeNumGroups', self.computeNumGroups)
-
-	-- do I have a per-element multiplciation function yet?
-	-- TODO this assertion is not necessary, but if it fails that means I will have to add bounds-checking of the index to the kernels.	
-	assert.eq(self.computeNumGroups.x * self.computeLocalSize.x, self.volumeRenderer.size.x)
-	assert.eq(self.computeNumGroups.y * self.computeLocalSize.y, self.volumeRenderer.size.y)
-	assert.eq(self.computeNumGroups.z * self.computeLocalSize.z, self.volumeRenderer.size.z)
 
 	self:recalc()
 	
@@ -244,6 +246,13 @@ function App:recalc()
 		self:recalcCPU()
 	end
 
+	print'data:'
+	for i=0,self.volumeRenderer.size:volume()-1 do
+		io.write('\t', self.volumeRenderer.data[i])
+		if bit.band(i, 15) == 15 then print() end
+	end
+	print()
+
 	-- [[ update the data
 	-- this could be done much faster as a reduce kernel
 	-- I'm already doing it this way in my hydro-cl project
@@ -320,7 +329,17 @@ function App:recalcGPU()
 	-- now that it's done .... where's the data?
 	-- TODO TODO update GLTex.toCPU to not bind at first, 
 	--  and to default to .data
-	self.volumeRenderer.tex:toCPU(self.volumeRenderer.data)
+	local tex = self.volumeRenderer.tex
+	--[[
+	tex:toCPU(self.volumeRenderer.data)
+	tex:unbind()
+	--]]
+	-- [[ maybe I need a FBO or something?
+	gl.glPixelStorei(gl.GL_PACK_ALIGNMENT, 1)
+	tex:bind()
+	gl.glGetTexImage(gl.GL_TEXTURE_3D, 0, gl.GL_RED, gl.GL_FLOAT, ffi.cast('char*', self.volumeRenderer.data))
+	tex:unbind()
+	--]]
 end
 
 return App():run()
