@@ -1,50 +1,69 @@
 #!/usr/bin/env luajit
 local ffi = require 'ffi'
-local table = require 'ext.table'
 local range = require 'ext.range'
 local cmdline = require 'ext.cmdline'(...)
-local vec2f = require 'vec-ffi.vec2f'
 local vec3i = require 'vec-ffi.vec3i'
-local vec3f = require 'vec-ffi.vec3f'
 local box3f = require 'vec-ffi.box3f'
 local gl = require 'gl.setup'(cmdline.gl)
-local glnumber = require 'gl.number'
-local GLSceneObject = require 'gl.sceneobject'
-local GLHSVTex2D = require 'gl.hsvtex2d'
-local GLArrayBuffer = require 'gl.arraybuffer'
 local ig = require 'imgui'
 local CuboidWireframe = require 'volume-renderer.cuboid-wireframe'
 local VolumeRenderer = require 'volume-renderer'
 
 
-local densitySize = vec3i(64, 64, 64) 
+local App = require 'imgui.appwithorbit'()
 
-local densityData = ffi.new('float[?]', densitySize:volume())
+function App:initGL()
+	App.super.initGL(self)
 
-local vars = {
-	useLog = true,
-	mandelConst = -.5,
-	mandelPerm = 0,	-- 0-3
-}
+	self.mandelConst = -.5
+	self.mandelPerm = 0	-- 0-3
 
-local logDensityEpsilon = 1e-5
 
-local densityRange = vec2f()
-local logDensityRange = vec2f()
+	-- range in 3D space
+	self.volumeRange = box3f(
+		{-1, -1, -1},
+		{1, 1, 1}
+	)
 
-local function recalc()
+	self.cuboidWireframe = CuboidWireframe{
+		view = self.view,
+		color = {.5, .5, .5, 1},
+	}
+	-- set it to update every frame
+	self.cuboidWireframe.globj.uniforms.mins = self.volumeRange.min.s
+	self.cuboidWireframe.globj.uniforms.maxs = self.volumeRange.max.s
+
+
+	self.volumeRenderer = VolumeRenderer{
+		view = self.view,
+		useLog = true,
+		size = {64, 64, 64},
+	}
+	self.densityData = self.volumeRenderer.data
+	self:recalc()
+	-- set it to update every frame
+	self.volumeRenderer.globj.uniforms.mins = self.volumeRange.min.s
+	self.volumeRenderer.globj.uniforms.maxs = self.volumeRange.max.s
+
+	gl.glEnable(gl.GL_DEPTH_TEST)
+	gl.glDepthFunc(gl.GL_LEQUAL)	-- for the wireframe
+end
+
+function App:recalc()
 	local b = box3f({-2, -2, -2}, {2, 2, 2})
-	local ptr = densityData+0
-	local fw = vars.mandelConst
-	local perm = vars.mandelPerm
+	local ptr = self.densityData+0
+	local fw = self.mandelConst
+	local perm = self.mandelPerm
 print('perm', perm)	-- I'm not seeing a difference	
+	local densityRange = self.volumeRenderer.densityRange
 	densityRange:set(math.huge, -math.huge)
-	for k=0,densitySize.z-1 do
-		local fz = (k+.5)/tonumber(densitySize.z) * (b.max.z - b.min.z) + b.min.z
-		for j=0,densitySize.y-1 do
-			local fy = (j+.5)/tonumber(densitySize.y) * (b.max.y - b.min.y) + b.min.y
-			for i=0,densitySize.x-1 do
-				local fx = (i+.5)/tonumber(densitySize.x) * (b.max.x - b.min.x) + b.min.x
+	local size = self.volumeRenderer.size
+	for k=0,size.z-1 do
+		local fz = (k+.5)/tonumber(size.z) * (b.max.z - b.min.z) + b.min.z
+		for j=0,size.y-1 do
+			local fy = (j+.5)/tonumber(size.y) * (b.max.y - b.min.y) + b.min.y
+			for i=0,size.x-1 do
+				local fx = (i+.5)/tonumber(size.x) * (b.max.x - b.min.x) + b.min.x
 				
 				-- mandelbrot init is z={0,0}, c={x,y}
 				-- julia init is z={x,y}, c=fixed
@@ -75,211 +94,22 @@ print('perm', perm)	-- I'm not seeing a difference
 		end
 	end
 
+	self.volumeRenderer.tex
+		:bind()
+		:subimage()
+		:unbind()
+
 	print('density range', densityRange)
 end
 
 
-_G.densityAlphaRange = vec3f(2, 0, 4)	-- .x = period, .y = offset, .z = gamma
-
--- range in 3D space
-_G.volumeRange = box3f(
-	vec3f(-1, -1, -1),
-	vec3f(1, 1, 1)
-)
-
-
-recalc()
-
-local App = require 'imgui.appwithorbit'()
-
-function App:initGL()
-	App.super.initGL(self)
-
-	self.cuboidWireframe = CuboidWireframe{
-		view = self.view,
-		color = {.5, .5, .5, 1},
-	}
-	-- set it to update every frame
-	self.cuboidWireframe.globj.uniforms.mins = volumeRange.min.s
-	self.cuboidWireframe.globj.uniforms.maxs = volumeRange.max.s
-
-
-	self.hsvTex = GLHSVTex2D(256, nil, true)
-		:unbind()
-
-	self.vtxGPUsPerSide = range(0,5):mapi(function(side)
-		local axis = side % 3
-		local pm = side >= 3
-
-		local k = axis
-		local k2 = (axis + 1) % 3
-		local k3 = (axis + 2) % 3
-		local function set(v, x,y,z)
-			v.s[k2] = x
-			v.s[k3] = y
-			v.s[k] = z
-		end
-
-		local sliceRes = densitySize.s[axis]
-		local vtxGPU = GLArrayBuffer{
-			dim = 3,
-			useVec = true,
-		}
-		local vtxCPU = vtxGPU:beginUpdate()
-		local imin, imax, istep
-		if pm then
-			imin, imax, istep = 0, sliceRes-1, 1
-		else
-			imin, imax, istep = sliceRes-1, 0, -1
-		end
-		for i=imin,imax,istep do
-			local f = (i + .5) / sliceRes
-			set(vtxCPU:emplace_back(), 0, 0, f)
-			set(vtxCPU:emplace_back(), 1, 0, f)
-			set(vtxCPU:emplace_back(), 0, 1, f)
-			set(vtxCPU:emplace_back(), 1, 0, f)
-			set(vtxCPU:emplace_back(), 0, 1, f)
-			set(vtxCPU:emplace_back(), 1, 1, f)
-		end
-		vtxGPU:endUpdate()
-		vtxGPU:unbind()
-		return vtxGPU
-	end)
---]=]
-
--- [=[
-	self.volumeRenderer = VolumeRenderer{
-		size = densitySize,
-		data = densityData,
-	}
-	self.volumeTex = self.volumeRenderer.tex
-
---[[ how to swap after-the-fact ?
-	self.volumeObj.vertexes = self.vtxGPUsPerSide[1]
-	self.volumeObj.attrs.vertex.buffer = self.volumeObj.vertexes
-	self.volumeObj.geometry.count = #self.volumeObj.vertexes.vec
---]]
-
-	local volumeVtxGPU = self.vtxGPUsPerSide[1]
-	self.volumeObj = GLSceneObject{
-		program = {
-			version = 'latest',
-			precision = 'best',
-			vertexCode = [[
-layout(location=0) in vec3 vertex;
-layout(location=0) out vec3 tc;
-
-uniform mat4 mvProjMat;
-uniform vec3 volumeMin, volumeMax;
-
-void main() {
-	tc = vertex;
-	gl_Position = mvProjMat * vec4(
-		mix(volumeMin, volumeMax, vertex),
-		1.
-	);
-}
-]],
-			fragmentCode = [[
-precision highp sampler3D;
-layout(location=0) in vec3 tc;
-layout(location=0) out vec4 fragColor;
-
-uniform sampler3D volumeTex;
-uniform sampler2D hsvTex;
-uniform vec2 densityRange;
-uniform vec3 densityAlphaRange;	// x = freq, y = offset, z = gamma
-uniform bool useLog;
-
-#define logDensityEpsilon ]]..glnumber(logDensityEpsilon)..[[ 
-
-float fpart(float x) {
-	return x - floor(x);
-}
-
-void main() {
-	float density = texture(volumeTex, tc).r;
-	if (useLog) {
-		density = log(density + logDensityEpsilon);
-	}
-	float gradLookup = (density - densityRange.x) / (densityRange.y - densityRange.x);
-
-	fragColor = texture(hsvTex, vec2(gradLookup, .5));
-	fragColor.a = pow(
-		fpart(density / densityAlphaRange.x + densityAlphaRange.y),
-		densityAlphaRange.z
-	);
-}
-]],
-			uniforms = {
-				volumeTex = 0,
-				hsvTex = 1,
-			},
-		},
-		geometry = {
-			mode = gl.GL_TRIANGLES,
-			count = #volumeVtxGPU.vec,
-		},
-		vertexes = volumeVtxGPU,
-		texs = {
-			self.volumeTex,
-			self.hsvTex,
-		},
-	}
---]=]
-
-	gl.glEnable(gl.GL_DEPTH_TEST)
-	gl.glDepthFunc(gl.GL_LEQUAL)
-	gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
-end
 
 function App:update()
 	gl.glClear(bit.bor(gl.GL_COLOR_BUFFER_BIT, gl.GL_DEPTH_BUFFER_BIT))
 
-	if self.cuboidWireframe then
-		-- TODO view mvMat scale to cube size
-		self.cuboidWireframe:draw()
-	end
-
-
-	local volumeObj = self.volumeObj
-	if volumeObj then
-		local fwd = self.view.angle:zAxis()
-		local absfwd = fwd:map(math.abs)
-		local maxdir = select(2, table.sup{absfwd:unpack()})-1
-		local vtxGPUIndex = maxdir + (fwd.s[maxdir] > 0 and 3 or 0)
-		local vtxGPU = self.vtxGPUsPerSide[1+vtxGPUIndex]
-		local lastVtxGPU = volumeObj.vertexes
-		if vtxGPU ~= lastVtxGPU then
-			volumeObj.vertexes = vtxGPU
-			volumeObj.attrs.vertex.buffer = vtxGPU
-			volumeObj.geometry.vertexes = vtxGPU
-			volumeObj.geometry.count = #vtxGPU.vec
-
-			-- weird interchange between GLSceneObject's .attrs (keyed by name, contains vao's ctor args)
-			--  and GLVertexArray's .attrs (keyed by index)
-			select(2, volumeObj.vao.attrs:find(nil, function(attr)
-				return attr.name == 'vertex'
-			end)).buffer = vtxGPU
-			volumeObj.vao:setAttrs()
-		end
-
-		gl.glDepthMask(gl.GL_FALSE)
-		gl.glEnable(gl.GL_BLEND)
-		volumeObj.uniforms.mvProjMat = self.view.mvProjMat.ptr
-		if vars.useLog then
-			logDensityRange.x = math.log(densityRange.x + logDensityEpsilon) 
-			logDensityRange.y = math.log(densityRange.y + logDensityEpsilon) 
-		end
-		volumeObj.uniforms.densityRange = vars.useLog and logDensityRange.s or densityRange.s
-		volumeObj.uniforms.densityAlphaRange = densityAlphaRange.s
-		volumeObj.uniforms.volumeMin = volumeRange.min.s
-		volumeObj.uniforms.volumeMax = volumeRange.max.s
-		volumeObj.uniforms.useLog = vars.useLog
-		volumeObj:draw()
-		gl.glDisable(gl.GL_BLEND)
-		gl.glDepthMask(gl.GL_TRUE)
-	end
+	self.cuboidWireframe:draw()
+	
+	self.volumeRenderer:draw()
 
 	App.super.update(self)
 end
@@ -297,31 +127,31 @@ function App:updateGUI()
 				self.view.pos:set(0,0,self.viewDist)
 			end
 
-			ig.igInputFloat('densityMin', densityRange.s + 0)
-			ig.igInputFloat('densityMax', densityRange.s + 1)
+			ig.igInputFloat('densityMin', self.volumeRenderer.densityRange.s + 0)
+			ig.igInputFloat('densityMax', self.volumeRenderer.densityRange.s + 1)
 
 			-- logDensity is normalized to this range [.x,.y], and then clamped to (0,1), and then scaled by .z
-			ig.igInputFloat('densityAlphaPeriod', densityAlphaRange.s + 0)
-			ig.igSliderFloat('densityAlphaOffset', densityAlphaRange.s + 1, 0, 1)
-			ig.igInputFloat('densityAlphaGamma', densityAlphaRange.s + 2)
+			ig.igInputFloat('densityAlphaPeriod', self.volumeRenderer.densityAlphaRange.s + 0)
+			ig.igSliderFloat('densityAlphaOffset', self.volumeRenderer.densityAlphaRange.s + 1, 0, 1)
+			ig.igInputFloat('densityAlphaGamma', self.volumeRenderer.densityAlphaRange.s + 2)
 
-			if ig.luatableInputFloat('mandelConst', vars, 'mandelConst') then
-				recalc()
+			if ig.luatableInputFloat('mandelConst', self, 'mandelConst') then
+				self:recalc()
 			end
-			if ig.luatableInputInt('mandelPerm', vars, 'mandelPerm') then
-				recalc()
+			if ig.luatableInputInt('mandelPerm', self, 'mandelPerm') then
+				self:recalc()
 			end
 
-			ig.luatableCheckbox('useLog', vars, 'useLog')
+			ig.luatableCheckbox('useLog', self.volumeRenderer, 'useLog')
 	
 -- [[
-			ig.igInputFloat('volumeMinX', volumeRange.min.s + 0)
-			ig.igInputFloat('volumeMinY', volumeRange.min.s + 1)
-			ig.igInputFloat('volumeMinZ', volumeRange.min.s + 2)
+			ig.igInputFloat('minX', self.volumeRange.min.s + 0)
+			ig.igInputFloat('minY', self.volumeRange.min.s + 1)
+			ig.igInputFloat('minZ', self.volumeRange.min.s + 2)
 
-			ig.igInputFloat('volumeMaxX', volumeRange.max.s + 0)
-			ig.igInputFloat('volumeMaxY', volumeRange.max.s + 1)
-			ig.igInputFloat('volumeMaxZ', volumeRange.max.s + 2)
+			ig.igInputFloat('maxX', self.volumeRange.max.s + 0)
+			ig.igInputFloat('maxY', self.volumeRange.max.s + 1)
+			ig.igInputFloat('maxZ', self.volumeRange.max.s + 2)
 --]]
 			ig.igEndMenu()
 		end
