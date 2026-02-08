@@ -275,8 +275,8 @@ print('flushValueGPUToCPU')
 	assert(not self.valueGPUDirty)
 	local tex = self.vol.tex
 	tex:bind()
-	tex:toCPU()
-	tex:unbind()
+		:getImage()
+		:unbind()
 	self.valueCPUDirty = nil
 end
 
