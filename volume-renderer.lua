@@ -42,6 +42,7 @@ args:
 	mins = (optional) bbox min
 	maxs = (optional) bbox max
 	useLog
+	TODO allow it to be passed its own GLTex3D as well
 --]]
 function VolumeRenderer:init(args)
 	self.size = vec3i((assert.index(args, 'size')))

@@ -48,7 +48,6 @@ function App:initGL()
 	self.cuboidWireframe.globj.uniforms.maxs = self.worldBBox.max.s
 
 
-	-- TODO allow it to be passed its own GLTex3D as well
 	self.vol = VolumeRenderer{
 		view = self.view,
 		--size = {4,4,4},
@@ -63,6 +62,11 @@ function App:initGL()
 	self.vol.globj.uniforms.maxs = self.worldBBox.max.s
 
 	self.graphBBox = box3f({-1, -1, -1}, {1, 1, 1})
+
+
+
+	-- [[ all of this is compute-shader-redundant and should go in its own function somewhere
+
 
 	-- prepare our mandelbrot calc compute shader
 
@@ -110,6 +114,11 @@ function App:initGL()
 	-- TODO this assertion is not necessary, but if it fails that means I will have to add bounds-checking of the index to the kernels.
 	assert.eq(self.computeNumGroups:elemMul(self.computeLocalSize), self.vol.size)
 
+
+	-- ]]
+
+
+
 	self.computeShader = GLProgram{
 		version = 'latest',
 		precision = 'best',
@@ -121,13 +130,12 @@ layout(local_size_x=<?=computeLocalSize.x
 
 layout(<?=texFormat?>, binding=0) uniform writeonly image3D dstTex;
 
-uniform vec3 graphMin;// = vec3(-1, -1, -1);
-uniform vec3 graphMax;// = vec3(1, 1, 1);
-uniform float mandelMaxIter;// = 20.;	// TODO mandelMaxIter
-uniform double mandelConst;// = -.5;
-uniform double mandelEscapeNormSq;// = 4.;
-uniform int mandelPerm;// = 2;	// TOOD mandelPerm
-
+uniform vec3 graphMin;
+uniform vec3 graphMax;
+uniform float mandelMaxIter;
+uniform double mandelConst;
+uniform double mandelEscapeNormSq;
+uniform int mandelPerm;
 
 void main() {
 	ivec3 itc = ivec3(gl_GlobalInvocationID.xyz);
