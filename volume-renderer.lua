@@ -132,6 +132,7 @@ function VolumeRenderer:init(args)
 
 
 	self.tex = GLTex3D{
+		immutable = true,
 		width = self.size.x,
 		height = self.size.y,
 		depth = self.size.z,
