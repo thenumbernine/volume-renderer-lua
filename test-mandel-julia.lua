@@ -117,7 +117,7 @@ function App:initGL()
 
 	-- ]]
 
-
+	local isES = GLProgram.getVersionPragma():match' es$'
 
 	self.computeShader = GLProgram{
 		version = 'latest',
@@ -128,7 +128,16 @@ layout(local_size_x=<?=computeLocalSize.x
 	?>, local_size_z=<?=computeLocalSize.z
 	?>) in;
 
+precision highp image3D;
+
 layout(<?=texFormat?>, binding=0) uniform writeonly image3D dstTex;
+
+<? if isES then ?>
+#define double float
+#define dvec2 vec2
+#define dvec3 vec3
+#define dvec4 vec4
+<? end ?>
 
 uniform vec3 graphMin;
 uniform vec3 graphMax;
@@ -176,6 +185,7 @@ void main() {
 ]], 	{
 			computeLocalSize = self.computeLocalSize,
 			texFormat = self.vol.tex:getFormatInfo().glslFormatName,
+			isES = isES,
 		}),
 	}
 		:bindImage(
